@@ -238,43 +238,72 @@ def price_rqmc_truncated_weighted(
     mean, se, low, high = ci95_from_samples(estimates)
     return PriceResult("RQMC Truncated", mean, se, low, high, high - low, time.perf_counter() - t0)
 
-def price_rqmc_icdf_strat_antithetic(
-    n: int,
-    r_repl: int,
-    seed: int,
-    s0_vec: np.ndarray,
-    sigma_vec: np.ndarray,
-    w_vec: np.ndarray,
-    k: float,
-    r: float,
-    t: float,
-    lmat: np.ndarray,
+
+def price_mc_stratified_naive(
+    n: int, seed: int, s0_vec: np.ndarray, sigma_vec: np.ndarray, 
+    w_vec: np.ndarray, k: float, r: float, t: float, lmat: np.ndarray
 ) -> PriceResult:
-    """
-    RQMC Sobol + inverse CDF, avec stratification sur la 1ère dimension et points antithétiques.
-    Chaque point u est accompagné de 1-u (antithétique).
-    """
     t0 = time.perf_counter()
     d = len(s0_vec)
-    m = int(math.ceil(math.log2(max(n // 2, 2))))
-    n_strat = n // 2
-    estimates = np.empty(r_repl)
-    for rep in range(r_repl):
-        eng = qmc.Sobol(d=d, scramble=True, seed=seed + rep)
-        u = eng.random_base2(m=m)[:n_strat, :]
-        u = np.clip(u, np.finfo(float).eps, 1.0 - np.finfo(float).eps)
-        # Stratification sur la première dimension
-        u[:, 0] = (np.arange(n_strat) + 0.5) / n_strat
-        # Générer les points antithétiques
-        u_anti = u.copy()
-        u_anti[:, 0] = 1.0 - u[:, 0]
-        u_full = np.vstack([u, u_anti])
-        z = norm.ppf(u_full)
-        x, _ = simulate_payoff(z, s0_vec, sigma_vec, w_vec, k, r, t, lmat)
-        estimates[rep] = float(np.mean(x))
-    mean, se, low, high = ci95_from_samples(estimates)
-    return PriceResult("RQMC ICDF Strat+Anti", mean, se, low, high, high - low, time.perf_counter() - t0)
+    rng = np.random.default_rng(seed)
+    n_batches = 50
+    steps = n // n_batches
+    batch_means = []
+    
+    for m in range(n_batches):
+        u_base = rng.uniform(0, 1, steps)
+        u_strat = (np.arange(steps) + u_base) / steps
+        z1 = norm.ppf(u_strat)
+        z_rest = rng.standard_normal((steps, d - 1))
+        z = np.column_stack([z1, z_rest])
+        payoffs, _ = simulate_payoff(z, s0_vec, sigma_vec, w_vec, k, r, t, lmat)
+        batch_means.append(np.mean(payoffs))
+        
+    mean, se, low, high = ci95_from_samples(np.array(batch_means))
+    return PriceResult("Stratif. Naïve (Z1)", mean, se, low, high, high - low, time.perf_counter() - t0)
 
+
+def price_mc_stratified_pca(
+    n: int, seed: int, s0_vec: np.ndarray, sigma_vec: np.ndarray, 
+    w_vec: np.ndarray, k: float, r: float, t: float, corr_mat: np.ndarray
+) -> PriceResult:
+    t0 = time.perf_counter()
+    d = len(s0_vec)
+    rng = np.random.default_rng(seed)
+    
+    # PCA sur la corrélation
+    eigvals, eigvecs = np.linalg.eigh(corr_mat)
+    idx_max = np.argmax(eigvals)
+    # Vecteur propre de la plus grande composante
+    v1 = eigvecs[:, idx_max] 
+    
+    # Cholesky classique pour le reste
+    lmat = chol_with_jitter(corr_mat)
+    
+    n_batches = 50
+    steps = n // n_batches
+    batch_means = []
+    
+    for m in range(n_batches):
+        u_strat = (np.arange(steps) + rng.uniform(0, 1, steps)) / steps
+        z_strat = norm.ppf(u_strat)
+        z_rest = rng.standard_normal((steps, d))
+        
+        # On remplace la projection sur la direction principale par la version stratifiée
+        # C'est ici qu'on injecte la stratification dans le bruit multidimensionnel
+        z_pca = z_rest @ lmat.T
+        proj = z_pca @ v1
+        z_final = z_pca + np.outer((z_strat - proj), v1)
+        
+        # Calcul direct du payoff
+        drift = (r - 0.5 * sigma_vec**2) * t
+        diffusion = sigma_vec * np.sqrt(t) * z_final
+        st = s0_vec * np.exp(drift + diffusion)
+        payoffs = np.exp(-r * t) * np.maximum(st @ w_vec - k, 0.0)
+        batch_means.append(np.mean(payoffs))
+        
+    mean, se, low, high = ci95_from_samples(np.array(batch_means))
+    return PriceResult("Stratif. PCA", mean, se, low, high, high - low, time.perf_counter() - t0)
 
 def run_methods(
     methods: List[str],
@@ -311,8 +340,6 @@ def run_methods(
             results.append(price_mc_control_variate(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat, antithetic=True))
         elif m == "RQMC ICDF":
             results.append(price_rqmc_icdf(n_rqmc, r_repl, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
-        elif m == "RQMC ICDF Strat+Anti":
-            results.append(price_rqmc_icdf_strat_antithetic(n_rqmc, r_repl, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
         elif m == "RQMC Truncated":
             results.append(
                 price_rqmc_truncated_weighted(
@@ -329,6 +356,10 @@ def run_methods(
                     trunc_a,
                 )
             )
+        elif m == "Stratif. Naïve (Z1)":
+            results.append(price_mc_stratified_naive(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
+        elif m == "Stratif. PCA":
+            results.append(price_mc_stratified_pca(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, corr))
 
     return results
 
@@ -435,8 +466,8 @@ def main() -> None:
         seed = st.number_input("Seed", min_value=1, max_value=999999, value=2026, step=1)
 
         st.subheader("Methodes")
-        all_methods = ["MC", "MC Antithetic", "MC + CV", "MC Anti + CV", "RQMC ICDF", "RQMC ICDF Strat+Anti", "RQMC Truncated"]
-        default_methods = ["MC", "MC Anti + CV", "RQMC ICDF", "RQMC ICDF Strat+Anti", "RQMC Truncated"]
+        all_methods = ["MC", "MC Antithetic", "MC + CV", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated", "Stratif. Naïve (Z1)", "Stratif. PCA"]
+        default_methods = ["MC", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated"]
         methods = st.multiselect("Selection", all_methods, default=default_methods)
 
         run_btn = st.button("Lancer le pricing", type="primary")
@@ -519,7 +550,7 @@ def main() -> None:
 
     with tabs[1]:
         st.subheader("Etude de sensibilite")
-        sens_method = st.selectbox("Methode pour la sensibilite", ["MC", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated"])
+        sens_method = st.selectbox("Methode pour la sensibilite", ["MC", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated", "Stratif. Naïve (Z1)", "Stratif. PCA"])
         sens_param = st.selectbox("Parametre a faire varier", ["s0", "k", "sigma", "r", "t", "d", "corr_rho"])
 
         points = st.slider("Nombre de points", min_value=5, max_value=30, value=15)
