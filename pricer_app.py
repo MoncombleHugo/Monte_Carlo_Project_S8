@@ -1,3 +1,39 @@
+def price_rqmc_icdf_strat_antithetic(
+    n: int,
+    r_repl: int,
+    seed: int,
+    s0_vec: np.ndarray,
+    sigma_vec: np.ndarray,
+    w_vec: np.ndarray,
+    k: float,
+    r: float,
+    t: float,
+    lmat: np.ndarray,
+) -> PriceResult:
+    """
+    RQMC Sobol + inverse CDF, avec stratification sur la 1ère dimension et points antithétiques.
+    Chaque point u est accompagné de 1-u (antithétique).
+    """
+    t0 = time.perf_counter()
+    d = len(s0_vec)
+    m = int(math.ceil(math.log2(max(n // 2, 2))))
+    n_strat = n // 2
+    estimates = np.empty(r_repl)
+    for rep in range(r_repl):
+        eng = qmc.Sobol(d=d, scramble=True, seed=seed + rep)
+        u = eng.random_base2(m=m)[:n_strat, :]
+        u = np.clip(u, np.finfo(float).eps, 1.0 - np.finfo(float).eps)
+        # Stratification sur la première dimension
+        u[:, 0] = (np.arange(n_strat) + 0.5) / n_strat
+        # Générer les points antithétiques
+        u_anti = u.copy()
+        u_anti[:, 0] = 1.0 - u[:, 0]
+        u_full = np.vstack([u, u_anti])
+        z = norm.ppf(u_full)
+        x, _ = simulate_payoff(z, s0_vec, sigma_vec, w_vec, k, r, t, lmat)
+        estimates[rep] = float(np.mean(x))
+    mean, se, low, high = ci95_from_samples(estimates)
+    return PriceResult("RQMC ICDF Strat+Anti", mean, se, low, high, high - low, time.perf_counter() - t0)
 import math
 import time
 from dataclasses import dataclass
@@ -274,6 +310,8 @@ def run_methods(
             results.append(price_mc_control_variate(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat, antithetic=True))
         elif m == "RQMC ICDF":
             results.append(price_rqmc_icdf(n_rqmc, r_repl, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
+        elif m == "RQMC ICDF Strat+Anti":
+            results.append(price_rqmc_icdf_strat_antithetic(n_rqmc, r_repl, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
         elif m == "RQMC Truncated":
             results.append(
                 price_rqmc_truncated_weighted(
@@ -396,8 +434,8 @@ def main() -> None:
         seed = st.number_input("Seed", min_value=1, max_value=999999, value=2026, step=1)
 
         st.subheader("Methodes")
-        all_methods = ["MC", "MC Antithetic", "MC + CV", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated"]
-        default_methods = ["MC", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated"]
+        all_methods = ["MC", "MC Antithetic", "MC + CV", "MC Anti + CV", "RQMC ICDF", "RQMC ICDF Strat+Anti", "RQMC Truncated"]
+        default_methods = ["MC", "MC Anti + CV", "RQMC ICDF", "RQMC ICDF Strat+Anti", "RQMC Truncated"]
         methods = st.multiselect("Selection", all_methods, default=default_methods)
 
         run_btn = st.button("Lancer le pricing", type="primary")
