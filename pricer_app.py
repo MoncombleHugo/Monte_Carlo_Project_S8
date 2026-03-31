@@ -178,6 +178,107 @@ def price_mc_control_variate(
     return PriceResult(method_name, mean, se, low, high, high - low, time.perf_counter() - t0)
 
 
+def translation_direction(
+    s0_vec: np.ndarray,
+    sigma_vec: np.ndarray,
+    w_vec: np.ndarray,
+    r: float,
+    t: float,
+    lmat: np.ndarray,
+) -> np.ndarray:
+    drift = (r - 0.5 * sigma_vec * sigma_vec) * t
+    basket_gradient_corr = w_vec * s0_vec * np.exp(drift) * sigma_vec * math.sqrt(t)
+    direction = basket_gradient_corr @ lmat
+    norm_dir = float(np.linalg.norm(direction))
+
+    if norm_dir <= 1e-15:
+        return np.full(len(s0_vec), 1.0 / math.sqrt(len(s0_vec)))
+
+    return direction / norm_dir
+
+
+def select_theta_translation(
+    n_pilot: int,
+    seed: int,
+    theta_grid: np.ndarray,
+    direction: np.ndarray,
+    s0_vec: np.ndarray,
+    sigma_vec: np.ndarray,
+    w_vec: np.ndarray,
+    k: float,
+    r: float,
+    t: float,
+    lmat: np.ndarray,
+) -> float:
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((n_pilot, len(s0_vec)))
+
+    best_theta = float(theta_grid[0])
+    best_var = float("inf")
+    projection = z @ direction
+
+    for theta in theta_grid:
+        shift = theta * direction
+        x_shifted, _ = simulate_payoff(z + shift, s0_vec, sigma_vec, w_vec, k, r, t, lmat)
+        weights = np.exp(-theta * projection - 0.5 * theta * theta)
+        y = x_shifted * weights
+        var = float(np.var(y, ddof=1))
+
+        if var < best_var:
+            best_var = var
+            best_theta = float(theta)
+
+    return best_theta
+
+
+def price_mc_translation(
+    n: int,
+    seed: int,
+    s0_vec: np.ndarray,
+    sigma_vec: np.ndarray,
+    w_vec: np.ndarray,
+    k: float,
+    r: float,
+    t: float,
+    lmat: np.ndarray,
+    n_pilot: int | None = None,
+    theta_grid: np.ndarray | None = None,
+) -> PriceResult:
+    t0 = time.perf_counter()
+    d = len(s0_vec)
+
+    if n_pilot is None:
+        n_pilot = 50_000 if d == 1 else 20_000
+
+    if theta_grid is None:
+        theta_grid = np.linspace(-2.0, 2.0, 101 if d == 1 else 41)
+
+    direction = translation_direction(s0_vec, sigma_vec, w_vec, r, t, lmat)
+    theta = select_theta_translation(
+        n_pilot=n_pilot,
+        seed=seed + 1,
+        theta_grid=theta_grid,
+        direction=direction,
+        s0_vec=s0_vec,
+        sigma_vec=sigma_vec,
+        w_vec=w_vec,
+        k=k,
+        r=r,
+        t=t,
+        lmat=lmat,
+    )
+
+    rng = np.random.default_rng(seed)
+    z = rng.standard_normal((n, d))
+    shift = theta * direction
+    x_shifted, _ = simulate_payoff(z + shift, s0_vec, sigma_vec, w_vec, k, r, t, lmat)
+    weights = np.exp(-theta * (z @ direction) - 0.5 * theta * theta)
+    y = x_shifted * weights
+
+    mean, se, low, high = ci95_from_samples(y)
+    return PriceResult("MC Translation", mean, se, low, high, high - low, time.perf_counter() - t0)
+
+
 def price_rqmc_icdf(
     n: int,
     r_repl: int,
@@ -240,8 +341,15 @@ def price_rqmc_truncated_weighted(
 
 
 def price_mc_stratified_naive(
-    n: int, seed: int, s0_vec: np.ndarray, sigma_vec: np.ndarray, 
-    w_vec: np.ndarray, k: float, r: float, t: float, lmat: np.ndarray
+    n: int,
+    seed: int,
+    s0_vec: np.ndarray,
+    sigma_vec: np.ndarray,
+    w_vec: np.ndarray,
+    k: float,
+    r: float,
+    t: float,
+    lmat: np.ndarray,
 ) -> PriceResult:
     t0 = time.perf_counter()
     d = len(s0_vec)
@@ -249,61 +357,60 @@ def price_mc_stratified_naive(
     n_batches = 50
     steps = n // n_batches
     batch_means = []
-    
-    for m in range(n_batches):
-        u_base = rng.uniform(0, 1, steps)
+
+    for _ in range(n_batches):
+        u_base = rng.uniform(0.0, 1.0, steps)
         u_strat = (np.arange(steps) + u_base) / steps
         z1 = norm.ppf(u_strat)
         z_rest = rng.standard_normal((steps, d - 1))
         z = np.column_stack([z1, z_rest])
         payoffs, _ = simulate_payoff(z, s0_vec, sigma_vec, w_vec, k, r, t, lmat)
         batch_means.append(np.mean(payoffs))
-        
-    mean, se, low, high = ci95_from_samples(np.array(batch_means))
-    return PriceResult("Stratif. Naïve (Z1)", mean, se, low, high, high - low, time.perf_counter() - t0)
+
+    mean, se, low, high = ci95_from_samples(np.asarray(batch_means))
+    return PriceResult("Stratif. Naive (Z1)", mean, se, low, high, high - low, time.perf_counter() - t0)
 
 
 def price_mc_stratified_pca(
-    n: int, seed: int, s0_vec: np.ndarray, sigma_vec: np.ndarray, 
-    w_vec: np.ndarray, k: float, r: float, t: float, corr_mat: np.ndarray
+    n: int,
+    seed: int,
+    s0_vec: np.ndarray,
+    sigma_vec: np.ndarray,
+    w_vec: np.ndarray,
+    k: float,
+    r: float,
+    t: float,
+    corr: np.ndarray,
 ) -> PriceResult:
     t0 = time.perf_counter()
-    d = len(s0_vec)
     rng = np.random.default_rng(seed)
-    
-    # PCA sur la corrélation
-    eigvals, eigvecs = np.linalg.eigh(corr_mat)
-    idx_max = np.argmax(eigvals)
-    # Vecteur propre de la plus grande composante
-    v1 = eigvecs[:, idx_max] 
-    
-    # Cholesky classique pour le reste
-    lmat = chol_with_jitter(corr_mat)
-    
+
+    eigvals, eigvecs = np.linalg.eigh(corr)
+    principal_direction = eigvecs[:, int(np.argmax(eigvals))]
+    lmat = chol_with_jitter(corr)
+
     n_batches = 50
     steps = n // n_batches
     batch_means = []
-    
-    for m in range(n_batches):
-        u_strat = (np.arange(steps) + rng.uniform(0, 1, steps)) / steps
+
+    for _ in range(n_batches):
+        u_strat = (np.arange(steps) + rng.uniform(0.0, 1.0, steps)) / steps
         z_strat = norm.ppf(u_strat)
-        z_rest = rng.standard_normal((steps, d))
-        
-        # On remplace la projection sur la direction principale par la version stratifiée
-        # C'est ici qu'on injecte la stratification dans le bruit multidimensionnel
-        z_pca = z_rest @ lmat.T
-        proj = z_pca @ v1
-        z_final = z_pca + np.outer((z_strat - proj), v1)
-        
-        # Calcul direct du payoff
-        drift = (r - 0.5 * sigma_vec**2) * t
-        diffusion = sigma_vec * np.sqrt(t) * z_final
-        st = s0_vec * np.exp(drift + diffusion)
-        payoffs = np.exp(-r * t) * np.maximum(st @ w_vec - k, 0.0)
+        z_rest = rng.standard_normal((steps, len(s0_vec)))
+
+        z_corr = z_rest @ lmat.T
+        projection = z_corr @ principal_direction
+        z_final = z_corr + np.outer(z_strat - projection, principal_direction)
+
+        drift = (r - 0.5 * sigma_vec * sigma_vec) * t
+        diffusion = sigma_vec * math.sqrt(t) * z_final
+        st_mat = s0_vec * np.exp(drift + diffusion)
+        payoffs = math.exp(-r * t) * np.maximum(st_mat @ w_vec - k, 0.0)
         batch_means.append(np.mean(payoffs))
-        
-    mean, se, low, high = ci95_from_samples(np.array(batch_means))
+
+    mean, se, low, high = ci95_from_samples(np.asarray(batch_means))
     return PriceResult("Stratif. PCA", mean, se, low, high, high - low, time.perf_counter() - t0)
+
 
 def run_methods(
     methods: List[str],
@@ -334,6 +441,8 @@ def run_methods(
             results.append(price_mc(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
         elif m == "MC Antithetic":
             results.append(price_mc_antithetic(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
+        elif m == "MC Translation":
+            results.append(price_mc_translation(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
         elif m == "MC + CV":
             results.append(price_mc_control_variate(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat, antithetic=False))
         elif m == "MC Anti + CV":
@@ -356,7 +465,7 @@ def run_methods(
                     trunc_a,
                 )
             )
-        elif m == "Stratif. Naïve (Z1)":
+        elif m == "Stratif. Naive (Z1)":
             results.append(price_mc_stratified_naive(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, lmat))
         elif m == "Stratif. PCA":
             results.append(price_mc_stratified_pca(n_mc, seed, s0_vec, sigma_vec, w_vec, k, r, t, corr))
@@ -466,8 +575,18 @@ def main() -> None:
         seed = st.number_input("Seed", min_value=1, max_value=999999, value=2026, step=1)
 
         st.subheader("Methodes")
-        all_methods = ["MC", "MC Antithetic", "MC + CV", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated", "Stratif. Naïve (Z1)", "Stratif. PCA"]
-        default_methods = ["MC", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated"]
+        all_methods = [
+            "MC",
+            "MC Antithetic",
+            "MC Translation",
+            "MC + CV",
+            "MC Anti + CV",
+            "RQMC ICDF",
+            "RQMC Truncated",
+            "Stratif. Naive (Z1)",
+            "Stratif. PCA",
+        ]
+        default_methods = ["MC", "MC Translation", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated"]
         methods = st.multiselect("Selection", all_methods, default=default_methods)
 
         run_btn = st.button("Lancer le pricing", type="primary")
@@ -550,7 +669,10 @@ def main() -> None:
 
     with tabs[1]:
         st.subheader("Etude de sensibilite")
-        sens_method = st.selectbox("Methode pour la sensibilite", ["MC", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated", "Stratif. Naïve (Z1)", "Stratif. PCA"])
+        sens_method = st.selectbox(
+            "Methode pour la sensibilite",
+            ["MC", "MC Translation", "MC Anti + CV", "RQMC ICDF", "RQMC Truncated", "Stratif. Naive (Z1)", "Stratif. PCA"],
+        )
         sens_param = st.selectbox("Parametre a faire varier", ["s0", "k", "sigma", "r", "t", "d", "corr_rho"])
 
         points = st.slider("Nombre de points", min_value=5, max_value=30, value=15)
