@@ -866,3 +866,7 @@ def main() -> None:
 
             st.caption("Astuce: pour les dimensions elevees, comparer RQMC ICDF et RQMC Truncated met en evidence la stabilite de la version ICDF.")
 
+
+if __name__ == "__main__":
+    main()
+
