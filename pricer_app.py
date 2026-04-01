@@ -386,8 +386,13 @@ def price_mc_stratified_pca(
     rng = np.random.default_rng(seed)
 
     eigvals, eigvecs = np.linalg.eigh(corr)
-    principal_direction = eigvecs[:, int(np.argmax(eigvals))]
-    lmat = chol_with_jitter(corr)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = np.clip(eigvals[order], 0.0, None)
+    eigvecs = eigvecs[:, order]
+
+    # Build sqrt(corr) in PCA basis: z_corr = y @ A.T with y ~ N(0, I_d)
+    # and A = Q diag(sqrt(lambda)). Stratification is applied on y[:, 0].
+    a_mat = eigvecs @ np.diag(np.sqrt(eigvals))
 
     n_batches = 50
     steps = n // n_batches
@@ -395,12 +400,11 @@ def price_mc_stratified_pca(
 
     for _ in range(n_batches):
         u_strat = (np.arange(steps) + rng.uniform(0.0, 1.0, steps)) / steps
-        z_strat = norm.ppf(u_strat)
-        z_rest = rng.standard_normal((steps, len(s0_vec)))
+        z_strat = norm.ppf(np.clip(u_strat, np.finfo(float).eps, 1.0 - np.finfo(float).eps))
 
-        z_corr = z_rest @ lmat.T
-        projection = z_corr @ principal_direction
-        z_final = z_corr + np.outer(z_strat - projection, principal_direction)
+        y = rng.standard_normal((steps, len(s0_vec)))
+        y[:, 0] = z_strat
+        z_final = y @ a_mat.T
 
         drift = (r - 0.5 * sigma_vec * sigma_vec) * t
         diffusion = sigma_vec * math.sqrt(t) * z_final
