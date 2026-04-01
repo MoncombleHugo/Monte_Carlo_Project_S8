@@ -473,6 +473,72 @@ def run_methods(
     return results
 
 
+def select_best_method_auto(
+    candidate_methods: List[str],
+    n_mc: int,
+    n_rqmc: int,
+    r_repl: int,
+    seed: int,
+    s0_vec: np.ndarray,
+    sigma_vec: np.ndarray,
+    w_vec: np.ndarray,
+    k: float,
+    r: float,
+    t: float,
+    corr: np.ndarray,
+    trunc_a: float,
+) -> Tuple[str, pd.DataFrame]:
+    d = len(s0_vec)
+
+    # Pilot budgets: cheap but informative.
+    n_mc_pilot = max(5_000, min(50_000, n_mc // 4))
+    n_rqmc_pilot = max(1_024, min(8_192, n_rqmc // 2))
+    r_repl_pilot = max(4, min(10, r_repl))
+
+    rows = []
+    for idx, method in enumerate(candidate_methods):
+        out = run_methods(
+            methods=[method],
+            n_mc=n_mc_pilot,
+            n_rqmc=n_rqmc_pilot,
+            r_repl=r_repl_pilot,
+            seed=seed + 10_000 + idx,
+            s0_vec=s0_vec,
+            sigma_vec=sigma_vec,
+            w_vec=w_vec,
+            k=k,
+            r=r,
+            t=t,
+            corr=corr,
+            trunc_a=trunc_a,
+            include_bs=False,
+        )[0]
+
+        ci_width = float(out.ci_width)
+        runtime = float(max(out.runtime_s, 1e-8))
+        score = ci_width * math.sqrt(runtime)
+
+        # Penalize known unstable corner for truncated RQMC in high dimensions.
+        if d >= 20 and method == "RQMC Truncated":
+            score *= 3.0
+
+        if not np.isfinite(ci_width) or not np.isfinite(runtime) or not np.isfinite(score):
+            score = 1e12
+
+        rows.append(
+            {
+                "Method": method,
+                "Pilot CI95 Width": ci_width,
+                "Pilot Runtime (s)": out.runtime_s,
+                "Score": score,
+            }
+        )
+
+    diag = pd.DataFrame(rows).sort_values("Score", ascending=True).reset_index(drop=True)
+    best_method = str(diag.iloc[0]["Method"])
+    return best_method, diag
+
+
 def results_to_frame(results: List[PriceResult], ref_price: float | None = None) -> pd.DataFrame:
     rows = []
     for r in results:
@@ -575,6 +641,11 @@ def main() -> None:
         seed = st.number_input("Seed", min_value=1, max_value=999999, value=2026, step=1)
 
         st.subheader("Methodes")
+        run_mode = st.radio(
+            "Mode de pricing",
+            ["Manuel", "Auto (choix optimal)"],
+            index=1,
+        )
         all_methods = [
             "MC",
             "MC Antithetic",
@@ -604,7 +675,7 @@ def main() -> None:
             st.plotly_chart(fig_corr, use_container_width=True)
 
         if run_btn:
-            if not methods:
+            if run_mode == "Manuel" and not methods:
                 st.warning("Selectionner au moins une methode.")
             else:
                 s0_vec = np.full(d, s0)
@@ -612,8 +683,38 @@ def main() -> None:
                 w_vec = np.full(d, 1.0 / d)
 
                 include_bs = d == 1 and mode == "European 1D"
+
+                selected_methods = methods
+                auto_diag = None
+                if run_mode == "Auto (choix optimal)":
+                    candidate_methods = [
+                        "MC",
+                        "MC Translation",
+                        "MC Anti + CV",
+                        "RQMC ICDF",
+                        "RQMC Truncated",
+                        "Stratif. PCA",
+                    ]
+                    best_method, auto_diag = select_best_method_auto(
+                        candidate_methods=candidate_methods,
+                        n_mc=int(n_mc),
+                        n_rqmc=int(n_rqmc),
+                        r_repl=int(r_repl),
+                        seed=int(seed),
+                        s0_vec=s0_vec,
+                        sigma_vec=sigma_vec,
+                        w_vec=w_vec,
+                        k=k,
+                        r=r,
+                        t=t,
+                        corr=corr,
+                        trunc_a=float(trunc_a),
+                    )
+                    selected_methods = [best_method]
+                    st.success(f"Méthode choisie automatiquement : {best_method}")
+
                 results = run_methods(
-                    methods=methods,
+                    methods=selected_methods,
                     n_mc=int(n_mc),
                     n_rqmc=int(n_rqmc),
                     r_repl=int(r_repl),
@@ -645,6 +746,10 @@ def main() -> None:
 
                 st.subheader("Tableau comparatif")
                 st.dataframe(df, use_container_width=True, hide_index=True)
+
+                if auto_diag is not None:
+                    st.subheader("Diagnostic de sélection automatique (run pilote)")
+                    st.dataframe(auto_diag, use_container_width=True, hide_index=True)
 
                 chart_df = df[df["Method"] != "Black-Scholes"].copy()
                 if not chart_df.empty:
@@ -725,6 +830,3 @@ def main() -> None:
 
             st.caption("Astuce: pour les dimensions elevees, comparer RQMC ICDF et RQMC Truncated met en evidence la stabilite de la version ICDF.")
 
-
-if __name__ == "__main__":
-    main()
