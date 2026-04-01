@@ -488,54 +488,86 @@ def select_best_method_auto(
     corr: np.ndarray,
     trunc_a: float,
 ) -> Tuple[str, pd.DataFrame]:
+    del candidate_methods, seed, r, t, trunc_a
+
     d = len(s0_vec)
+    basket_spot = float(np.dot(w_vec, s0_vec))
+    moneyness = basket_spot / max(float(k), 1e-12)
+    log_moneyness = float(math.log(max(moneyness, 1e-12)))
+    sigma_eff = float(np.dot(w_vec, sigma_vec))
 
-    # Pilot budgets: cheap but informative.
-    n_mc_pilot = max(5_000, min(50_000, n_mc // 4))
-    n_rqmc_pilot = max(1_024, min(8_192, n_rqmc // 2))
-    r_repl_pilot = max(4, min(10, r_repl))
+    off_diag = corr[~np.eye(d, dtype=bool)] if d > 1 else np.array([0.0])
+    mean_abs_corr = float(np.mean(np.abs(off_diag)))
 
-    rows = []
-    for idx, method in enumerate(candidate_methods):
-        out = run_methods(
-            methods=[method],
-            n_mc=n_mc_pilot,
-            n_rqmc=n_rqmc_pilot,
-            r_repl=r_repl_pilot,
-            seed=seed + 10_000 + idx,
-            s0_vec=s0_vec,
-            sigma_vec=sigma_vec,
-            w_vec=w_vec,
-            k=k,
-            r=r,
-            t=t,
-            corr=corr,
-            trunc_a=trunc_a,
-            include_bs=False,
-        )[0]
+    rqmc_budget = int(n_rqmc) * int(r_repl)
+    high_rqmc_budget = rqmc_budget >= 90_000
+    rich_mc_budget = int(n_mc) >= 120_000
 
-        ci_width = float(out.ci_width)
-        runtime = float(max(out.runtime_s, 1e-8))
-        score = ci_width * math.sqrt(runtime)
+    decision_rules: List[str] = []
 
-        # Penalize known unstable corner for truncated RQMC in high dimensions.
-        if d >= 20 and method == "RQMC Truncated":
-            score *= 3.0
+    if d == 1:
+        if moneyness <= 0.9 or moneyness >= 1.15:
+            best_method = "MC Translation"
+            decision_rules.append("1D loin de la monnaie: translation pour mieux capter les événements rares")
+        elif high_rqmc_budget and 0.10 <= sigma_eff <= 0.45:
+            best_method = "RQMC ICDF"
+            decision_rules.append("1D quasi ATM avec budget RQMC suffisant: RQMC ICDF")
+        else:
+            best_method = "MC Anti + CV"
+            decision_rules.append("1D régime standard: MC antithétique + variable de contrôle")
+    elif d <= 8:
+        if mean_abs_corr >= 0.55 and rich_mc_budget:
+            best_method = "Stratif. PCA"
+            decision_rules.append("corrélation forte en faible dimension: stratification PCA")
+        elif high_rqmc_budget and sigma_eff <= 0.40:
+            best_method = "RQMC ICDF"
+            decision_rules.append("faible dimension avec budget RQMC élevé: RQMC ICDF")
+        else:
+            best_method = "MC Anti + CV"
+            decision_rules.append("faible dimension sans signal dominant: MC Anti + CV")
+    elif d <= 20:
+        if high_rqmc_budget and mean_abs_corr <= 0.60 and abs(log_moneyness) <= 0.20:
+            best_method = "RQMC ICDF"
+            decision_rules.append("dimension intermédiaire et structure régulière: RQMC ICDF")
+        elif mean_abs_corr >= 0.65 and rich_mc_budget:
+            best_method = "Stratif. PCA"
+            decision_rules.append("corrélation marquée: stratification PCA")
+        else:
+            best_method = "MC Anti + CV"
+            decision_rules.append("dimension intermédiaire robuste: MC Anti + CV")
+    else:
+        if high_rqmc_budget and d <= 40 and mean_abs_corr <= 0.45 and sigma_eff <= 0.30:
+            best_method = "RQMC ICDF"
+            decision_rules.append("haute dimension modérée avec faible corrélation: RQMC ICDF")
+        else:
+            best_method = "MC Anti + CV"
+            decision_rules.append("haute dimension: méthode la plus robuste en temps et stabilité")
 
-        if not np.isfinite(ci_width) or not np.isfinite(runtime) or not np.isfinite(score):
-            score = 1e12
+    if best_method not in {
+        "MC",
+        "MC Translation",
+        "MC Anti + CV",
+        "RQMC ICDF",
+        "RQMC Truncated",
+        "Stratif. PCA",
+    }:
+        best_method = "MC Anti + CV"
+        decision_rules.append("fallback de sécurité")
 
-        rows.append(
-            {
-                "Method": method,
-                "Pilot CI95 Width": ci_width,
-                "Pilot Runtime (s)": out.runtime_s,
-                "Score": score,
-            }
-        )
+    diag = pd.DataFrame(
+        [
+            {"Metric": "Dimension", "Value": d},
+            {"Metric": "Moneyness (S0/K)", "Value": round(moneyness, 6)},
+            {"Metric": "log-moneyness", "Value": round(log_moneyness, 6)},
+            {"Metric": "Volatilité efficace", "Value": round(sigma_eff, 6)},
+            {"Metric": "Moyenne |corr| hors diagonale", "Value": round(mean_abs_corr, 6)},
+            {"Metric": "Budget MC", "Value": int(n_mc)},
+            {"Metric": "Budget RQMC total (N x R)", "Value": int(rqmc_budget)},
+            {"Metric": "Méthode choisie", "Value": best_method},
+            {"Metric": "Règle appliquée", "Value": " | ".join(decision_rules)},
+        ]
+    )
 
-    diag = pd.DataFrame(rows).sort_values("Score", ascending=True).reset_index(drop=True)
-    best_method = str(diag.iloc[0]["Method"])
     return best_method, diag
 
 
@@ -748,7 +780,7 @@ def main() -> None:
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
                 if auto_diag is not None:
-                    st.subheader("Diagnostic de sélection automatique (run pilote)")
+                    st.subheader("Diagnostic de sélection automatique (règles rapides)")
                     st.dataframe(auto_diag, use_container_width=True, hide_index=True)
 
                 chart_df = df[df["Method"] != "Black-Scholes"].copy()
