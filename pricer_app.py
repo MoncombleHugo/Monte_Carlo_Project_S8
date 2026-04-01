@@ -491,87 +491,77 @@ def select_best_method_auto(
     t: float,
     corr: np.ndarray,
     trunc_a: float,
+    precision_weight: float,
 ) -> Tuple[str, pd.DataFrame]:
-    del candidate_methods, seed, r, t, trunc_a
-
     d = len(s0_vec)
-    basket_spot = float(np.dot(w_vec, s0_vec))
-    moneyness = basket_spot / max(float(k), 1e-12)
-    log_moneyness = float(math.log(max(moneyness, 1e-12)))
-    sigma_eff = float(np.dot(w_vec, sigma_vec))
+    precision_weight = float(np.clip(precision_weight, 0.0, 1.0))
+    speed_weight = 1.0 - precision_weight
 
-    off_diag = corr[~np.eye(d, dtype=bool)] if d > 1 else np.array([0.0])
-    mean_abs_corr = float(np.mean(np.abs(off_diag)))
-
-    rqmc_budget = int(n_rqmc) * int(r_repl)
-    high_rqmc_budget = rqmc_budget >= 90_000
-    rich_mc_budget = int(n_mc) >= 120_000
-
-    decision_rules: List[str] = []
-
+    # Keep a small candidate set by dimension, then arbitrate only on precision/runtime.
     if d == 1:
-        if moneyness <= 0.9 or moneyness >= 1.15:
-            best_method = "MC Translation"
-            decision_rules.append("1D loin de la monnaie: translation pour mieux capter les événements rares")
-        elif high_rqmc_budget and 0.10 <= sigma_eff <= 0.45:
-            best_method = "RQMC ICDF"
-            decision_rules.append("1D quasi ATM avec budget RQMC suffisant: RQMC ICDF")
-        else:
-            best_method = "MC Anti + CV"
-            decision_rules.append("1D régime standard: MC antithétique + variable de contrôle")
-    elif d <= 8:
-        if mean_abs_corr >= 0.55 and rich_mc_budget:
-            best_method = "Stratif. PCA"
-            decision_rules.append("corrélation forte en faible dimension: stratification PCA")
-        elif high_rqmc_budget and sigma_eff <= 0.40:
-            best_method = "RQMC ICDF"
-            decision_rules.append("faible dimension avec budget RQMC élevé: RQMC ICDF")
-        else:
-            best_method = "MC Anti + CV"
-            decision_rules.append("faible dimension sans signal dominant: MC Anti + CV")
+        base_candidates = ["MC Anti + CV", "MC Translation", "RQMC ICDF", "RQMC Truncated", "MC + CV"]
     elif d <= 20:
-        if high_rqmc_budget and mean_abs_corr <= 0.60 and abs(log_moneyness) <= 0.20:
-            best_method = "RQMC ICDF"
-            decision_rules.append("dimension intermédiaire et structure régulière: RQMC ICDF")
-        elif mean_abs_corr >= 0.65 and rich_mc_budget:
-            best_method = "Stratif. PCA"
-            decision_rules.append("corrélation marquée: stratification PCA")
-        else:
-            best_method = "MC Anti + CV"
-            decision_rules.append("dimension intermédiaire robuste: MC Anti + CV")
+        base_candidates = ["MC Anti + CV", "RQMC ICDF", "Stratif. PCA", "MC"]
     else:
-        if high_rqmc_budget and d <= 40 and mean_abs_corr <= 0.45 and sigma_eff <= 0.30:
-            best_method = "RQMC ICDF"
-            decision_rules.append("haute dimension modérée avec faible corrélation: RQMC ICDF")
-        else:
-            best_method = "MC Anti + CV"
-            decision_rules.append("haute dimension: méthode la plus robuste en temps et stabilité")
+        base_candidates = ["MC Anti + CV", "RQMC ICDF", "MC"]
 
-    if best_method not in {
-        "MC",
-        "MC Translation",
-        "MC Anti + CV",
-        "RQMC ICDF",
-        "RQMC Truncated",
-        "Stratif. PCA",
-    }:
-        best_method = "MC Anti + CV"
-        decision_rules.append("fallback de sécurité")
+    candidates = [m for m in base_candidates if m in candidate_methods]
+    if not candidates:
+        candidates = ["MC Anti + CV"]
 
-    diag = pd.DataFrame(
+    pilot_n_mc = int(min(30_000, max(6_000, n_mc // 20)))
+    pilot_n_rqmc = int(min(4_096, max(1_024, n_rqmc // 8)))
+    pilot_r = int(min(8, max(4, r_repl // 2)))
+
+    pilot_rows = []
+    for i, method in enumerate(candidates):
+        out = run_methods(
+            methods=[method],
+            n_mc=pilot_n_mc,
+            n_rqmc=pilot_n_rqmc,
+            r_repl=pilot_r,
+            seed=int(seed) + 97 * i,
+            s0_vec=s0_vec,
+            sigma_vec=sigma_vec,
+            w_vec=w_vec,
+            k=k,
+            r=r,
+            t=t,
+            corr=corr,
+            trunc_a=trunc_a,
+            include_bs=False,
+        )[0]
+        pilot_rows.append({"Method": method, "CI95 Width": out.ci_width, "Runtime (s)": out.runtime_s})
+
+    pilot_df = pd.DataFrame(pilot_rows)
+
+    def norm_col(s: pd.Series) -> pd.Series:
+        smin, smax = float(s.min()), float(s.max())
+        span = smax - smin
+        if span <= 1e-15:
+            return pd.Series(np.zeros(len(s)), index=s.index)
+        return (s - smin) / span
+
+    pilot_df["CI_norm"] = norm_col(pilot_df["CI95 Width"])
+    pilot_df["RT_norm"] = norm_col(pilot_df["Runtime (s)"])
+    pilot_df["Score"] = precision_weight * pilot_df["CI_norm"] + speed_weight * pilot_df["RT_norm"]
+    pilot_df = pilot_df.sort_values("Score", ascending=True).reset_index(drop=True)
+    pilot_df.insert(0, "Rank", np.arange(1, len(pilot_df) + 1))
+
+    best_method = str(pilot_df.iloc[0]["Method"])
+    pilot_df["Selected"] = ["yes" if i == 0 else "" for i in range(len(pilot_df))]
+
+    # Append run context for transparency.
+    summary = pd.DataFrame(
         [
-            {"Metric": "Dimension", "Value": d},
-            {"Metric": "Moneyness (S0/K)", "Value": round(moneyness, 6)},
-            {"Metric": "log-moneyness", "Value": round(log_moneyness, 6)},
-            {"Metric": "Volatilité efficace", "Value": round(sigma_eff, 6)},
-            {"Metric": "Moyenne |corr| hors diagonale", "Value": round(mean_abs_corr, 6)},
-            {"Metric": "Budget MC", "Value": int(n_mc)},
-            {"Metric": "Budget RQMC total (N x R)", "Value": int(rqmc_budget)},
-            {"Metric": "Méthode choisie", "Value": best_method},
-            {"Metric": "Règle appliquée", "Value": " | ".join(decision_rules)},
+            {"Rank": "-", "Method": "[context] d", "CI95 Width": float(d), "Runtime (s)": np.nan, "CI_norm": np.nan, "RT_norm": np.nan, "Score": np.nan, "Selected": ""},
+            {"Rank": "-", "Method": "[context] pilot N_MC", "CI95 Width": float(pilot_n_mc), "Runtime (s)": np.nan, "CI_norm": np.nan, "RT_norm": np.nan, "Score": np.nan, "Selected": ""},
+            {"Rank": "-", "Method": "[context] pilot N_RQMC", "CI95 Width": float(pilot_n_rqmc), "Runtime (s)": np.nan, "CI_norm": np.nan, "RT_norm": np.nan, "Score": np.nan, "Selected": ""},
+            {"Rank": "-", "Method": "[context] pilot R", "CI95 Width": float(pilot_r), "Runtime (s)": np.nan, "CI_norm": np.nan, "RT_norm": np.nan, "Score": np.nan, "Selected": ""},
+            {"Rank": "-", "Method": "[context] poids_precision", "CI95 Width": float(precision_weight), "Runtime (s)": np.nan, "CI_norm": np.nan, "RT_norm": np.nan, "Score": np.nan, "Selected": ""},
         ]
     )
-
+    diag = pd.concat([pilot_df, summary], ignore_index=True)
     return best_method, diag
 
 
@@ -682,6 +672,14 @@ def main() -> None:
             ["Manuel", "Auto (choix optimal)"],
             index=1,
         )
+        precision_weight = st.slider(
+            "Auto: poids de la precision (vs vitesse)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.65,
+            step=0.05,
+            help="0 = priorité vitesse, 1 = priorité precision.",
+        )
         all_methods = [
             "MC",
             "MC Antithetic",
@@ -745,6 +743,7 @@ def main() -> None:
                         t=t,
                         corr=corr,
                         trunc_a=float(trunc_a),
+                        precision_weight=float(precision_weight),
                     )
                     selected_methods = [best_method]
                     st.success(f"Méthode choisie automatiquement : {best_method}")
@@ -784,7 +783,7 @@ def main() -> None:
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
                 if auto_diag is not None:
-                    st.subheader("Diagnostic de sélection automatique (règles rapides)")
+                    st.subheader("Diagnostic de sélection automatique (arbitrage précision/temps)")
                     st.dataframe(auto_diag, use_container_width=True, hide_index=True)
 
                 chart_df = df[df["Method"] != "Black-Scholes"].copy()
